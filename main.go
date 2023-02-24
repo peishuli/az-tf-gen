@@ -1,16 +1,23 @@
 /************************************************************************************************************************************
-* References:
+References:
   https://github.com/Azure-Samples/azure-sdk-for-go-samples/blob/main/sdk/resourcemanager/resource/resourcegroups/main.go
   https://pkg.go.dev/github.com/hashicorp/hcl/v2/hclwrite#pkg-overview
+  https://magodo.github.io/editing-hcl/
+  https://discuss.hashicorp.com/t/hclwrite-v2-a-object-with-a-reference-value/26524
+  https://stackoverflow.com/questions/67945463/how-to-use-hcl-write-to-set-expressions-with
+  https://github.com/hashicorp/hcl/issues/373
+  https://github.com/hashicorp/hcl/issues/442
 *************************************************************************************************************************************/
-
 package main
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	// "github.com/hashicorp/hcl2/hclwrite" //DO NOT use this package, generated blocks from it don't have nice line breaks/indentations
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 
@@ -24,8 +31,14 @@ import (
 var (
 	subscriptionID    string
 	location          = "South Central US"
-	resourceGroupName = "pli-demo-rg"
+	resourceGroupName = "pli-rg-demogroup"
+	
 )
+
+const module = "./generated/module"
+const terragrunt = "./generated/terragrunt"
+
+var var_infos = []VariableInfo{}
 
 func main() {
 	subscriptionID = os.Getenv("AZURE_SUBSCRIPTION_ID")
@@ -43,12 +56,30 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	var_rg := VariableInfo {
+		prop_name: "name",
+		var_name: "rg_name",
+		var_type: "string",
+		default_val: *resourceGroup.Name,
+	}
+	var_infos = append(var_infos, var_rg)
+	
+	var_location := VariableInfo{
+		prop_name: "location",
+		var_name: "location",
+		var_type: "string",
+		default_val: *resourceGroup.Location,
+	}
+	var_infos = append(var_infos, var_location)
+
 	writeTFProviders()
 	writeTFConfig(resourceGroup)
 }
 
 func writeTFProviders() {
-	tfFile, err := os.Create("providers.tf")
+	filename := fmt.Sprintf("%s/providers.tf", module)
+	tfFile, err := os.Create(filename)
 	if err != nil {
 		log.Println(err)
 		return
@@ -77,7 +108,8 @@ func writeTFProviders() {
 }
 
 func writeTFConfig(rg *armresources.ResourceGroup) {
-	tfFile, err := os.Create("main.tf")
+	filename := fmt.Sprintf("%s/main.tf", module)
+	tfFile, err := os.Create(filename)
 	if err != nil {
 		log.Println(err)
 		return
@@ -87,20 +119,40 @@ func writeTFConfig(rg *armresources.ResourceGroup) {
 
 	rgBlock := rootBody.AppendNewBlock("resource", []string{"azurerm_resource_group", "this"})
 	rgBody := rgBlock.Body()
-	rgBody.SetAttributeValue("name", cty.StringVal(*rg.Name))
-	// rgBody.SetAttributeValue("name", cty.StringVal(fmt.Sprintf("new-%s", *rg.Name)))
-	rgBody.SetAttributeValue("location", cty.StringVal(*rg.Location))
-
-	tags := make(map[string]cty.Value)
-	for k, v := range rg.Tags {
-		tags[k] = cty.StringVal(*v)
+	
+	for _, var_info := range var_infos {
+		var_name := var_info.var_name
+		rgBody.SetAttributeTraversal(var_info.prop_name, hcl.Traversal{
+			hcl.TraverseRoot{Name: "var"},
+			hcl.TraverseAttr{Name: var_name},
+		})
 	}
-
+	
+	
+	tags := make(map[string]cty.Value)		
+	for k, v := range rg.Tags {		
+		tag_var := fmt.Sprintf("${var.%s}", strings.ToLower(k))
+		tags[k] = cty.StringVal(tag_var)
+		var_tag := VariableInfo {
+			var_name: strings.ToLower(k),
+			var_type: "string",
+			default_val: *v,
+		}
+		var_infos = append(var_infos, var_tag)
+	}	
 	rgBody.SetAttributeValue("tags", cty.ObjectVal(tags))
+		
+	WriteVariableFile()
+	GenerateDefaultTFVars()
+	WriteTerragruntFile()
 
-	// log.Printf("%s", f.Bytes())
-	tfFile.Write(f.Bytes())
+	//TODO: temporary workaround to get rid of extras in "{$$name=var.name}"
+	bodyString := string(f.Bytes())
+	bodyString = strings.Replace(bodyString, "\"$${", "", -1)
+	bodyString = strings.Replace(bodyString, "}\"", "", -1)
+	tfFile.Write([]byte(bodyString))
 }
+
 
 func getResourceGroup(ctx context.Context, cred azcore.TokenCredential) (*armresources.ResourceGroup, error) {
 	resourceGroupClient, err := armresources.NewResourceGroupsClient(subscriptionID, cred, nil)
@@ -113,4 +165,82 @@ func getResourceGroup(ctx context.Context, cred azcore.TokenCredential) (*armres
 		return nil, err
 	}
 	return &resourceGroupResp.ResourceGroup, nil
+}
+
+func WriteVariableFile() {
+	filename := fmt.Sprintf("%s/variables.tf", module)
+	tfFile, err := os.Create(filename)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	f := hclwrite.NewEmptyFile()
+	rootBody := f.Body()
+	rootBody.AppendNewline()
+	for _,  var_info := range var_infos {		
+		varBlock := *rootBody.AppendNewBlock("variable",[]string{var_info.var_name})
+		// varBody := varBlock.Body()
+		typeTokens := hclwrite.Tokens {
+			{
+				Type: hclsyntax.TokenIdent,
+				Bytes: []byte(var_info.var_type),
+			},
+		}
+		varBlock.Body().SetAttributeRaw("type", typeTokens)
+		// varBody.SetAttributeValue("default", cty.StringVal(var_info.default_val)) //TODO: make it type dependent
+	}
+	tfFile.Write(f.Bytes())
+
+}
+
+func GenerateDefaultTFVars() {
+	filename := fmt.Sprintf("%s/defualt.tfvars", module)
+	tfFile, err := os.Create(filename)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+	f := hclwrite.NewEmptyFile()
+	rootBody := f.Body()
+	for _,  var_info := range var_infos {
+		rootBody.SetAttributeValue(var_info.var_name, cty.StringVal(var_info.default_val))
+	}
+	tfFile.Write(f.Bytes())
+}
+
+func WriteTerragruntFile() {
+	filename := fmt.Sprintf("%s/terragrunt.hcl", terragrunt)
+	tfFile, err := os.Create(filename)
+	if err != nil {
+		log.Println(err)
+		return
+	}
+
+	f := hclwrite.NewEmptyFile()
+	rootBody := f.Body()
+	
+	// Write the terraform block
+	tfBlock := rootBody.AppendNewBlock("terraform", nil)
+	tfBody := tfBlock.Body()
+	tfBody.SetAttributeValue("source", cty.StringVal("../module"))
+	
+	// Write a line break
+	rootBody.AppendNewline()
+	
+	// Write the inputs block
+	inputs := make(map[string]cty.Value)
+	for _,  var_info := range var_infos {		
+		inputs[var_info.var_name] = cty.StringVal(var_info.default_val)
+	}
+	rootBody.SetAttributeValue("inputs", cty.ObjectVal(inputs))
+	tfFile.Write(f.Bytes())
+
+}
+
+type VariableInfo struct {
+	prop_name string
+	var_name string
+	var_type string
+	default_val string
 }

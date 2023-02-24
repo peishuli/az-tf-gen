@@ -2,3 +2,6 @@ credentials.txt
 .terraform*
 terraform.*
 *.tf
+*.tfvars
+.terragrunt*
+*.hcl
